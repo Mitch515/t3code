@@ -4,13 +4,28 @@ import * as FS from "node:fs";
 import * as OS from "node:os";
 import * as Path from "node:path";
 
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, protocol, shell } from "electron";
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  Menu,
+  nativeImage,
+  protocol,
+  safeStorage,
+  shell,
+} from "electron";
 import type { MenuItemConstructorOptions } from "electron";
 import * as Effect from "effect/Effect";
-import type { DesktopUpdateActionResult, DesktopUpdateState } from "@t3tools/contracts";
+import type {
+  ContextMenuItem,
+  DesktopConnectionInfo,
+  DesktopConnectionSettings,
+  DesktopUpdateActionResult,
+  DesktopUpdateState,
+} from "@t3tools/contracts";
 import { autoUpdater } from "electron-updater";
 
-import type { ContextMenuItem } from "@t3tools/contracts";
 import { NetService } from "@t3tools/shared/Net";
 import { RotatingFileSink } from "@t3tools/shared/logging";
 import { showDesktopConfirmDialog } from "./confirmDialog";
@@ -44,8 +59,11 @@ const UPDATE_STATE_CHANNEL = "desktop:update-state";
 const UPDATE_GET_STATE_CHANNEL = "desktop:update-get-state";
 const UPDATE_DOWNLOAD_CHANNEL = "desktop:update-download";
 const UPDATE_INSTALL_CHANNEL = "desktop:update-install";
+const GET_CONNECTION_INFO_CHANNEL = "desktop:get-connection-info";
+const SET_CONNECTION_SETTINGS_CHANNEL = "desktop:set-connection-settings";
 const STATE_DIR =
   process.env.T3CODE_STATE_DIR?.trim() || Path.join(OS.homedir(), ".t3", "userdata");
+const CONNECTION_SETTINGS_PATH = Path.join(STATE_DIR, "desktop-connection.json");
 const DESKTOP_SCHEME = "t3";
 const ROOT_DIR = Path.resolve(__dirname, "../../..");
 const isDevelopment = Boolean(process.env.VITE_DEV_SERVER_URL);
@@ -63,8 +81,20 @@ const AUTO_UPDATE_STARTUP_DELAY_MS = 15_000;
 const AUTO_UPDATE_POLL_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const DESKTOP_UPDATE_CHANNEL = "latest";
 const DESKTOP_UPDATE_ALLOW_PRERELEASE = false;
+const DEFAULT_DESKTOP_CONNECTION_SETTINGS: DesktopConnectionSettings = {
+  mode: "local",
+  remoteServerUrl: "",
+  remoteAuthToken: "",
+};
 
 type DesktopUpdateErrorContext = DesktopUpdateState["errorContext"];
+type PersistedDesktopConnectionRecord = {
+  version: 1;
+  mode: DesktopConnectionSettings["mode"];
+  remoteServerUrl: string;
+  remoteAuthToken: string;
+  remoteAuthTokenEncrypted: boolean;
+};
 
 let mainWindow: BrowserWindow | null = null;
 let backendProcess: ChildProcess.ChildProcess | null = null;
@@ -88,6 +118,232 @@ const desktopRuntimeInfo = resolveDesktopRuntimeInfo({
 });
 const initialUpdateState = (): DesktopUpdateState =>
   createInitialDesktopUpdateState(app.getVersion(), desktopRuntimeInfo);
+
+function cloneDesktopConnectionSettings(
+  settings: DesktopConnectionSettings = DEFAULT_DESKTOP_CONNECTION_SETTINGS,
+): DesktopConnectionSettings {
+  return {
+    mode: settings.mode === "remote" ? "remote" : "local",
+    remoteServerUrl: settings.remoteServerUrl ?? "",
+    remoteAuthToken: settings.remoteAuthToken ?? "",
+  };
+}
+
+function ensureStateDir(): void {
+  FS.mkdirSync(STATE_DIR, { recursive: true });
+}
+
+function sanitizeDesktopConnectionSettings(
+  raw: Partial<DesktopConnectionSettings> | null | undefined,
+): DesktopConnectionSettings {
+  return {
+    mode: raw?.mode === "remote" ? "remote" : "local",
+    remoteServerUrl: raw?.remoteServerUrl?.trim() ?? "",
+    remoteAuthToken: raw?.remoteAuthToken?.trim() ?? "",
+  };
+}
+
+function encodeConnectionSecret(secret: string): {
+  value: string;
+  encrypted: boolean;
+} {
+  if (secret.length === 0) {
+    return { value: "", encrypted: false };
+  }
+
+  try {
+    if (safeStorage.isEncryptionAvailable()) {
+      return {
+        value: safeStorage.encryptString(secret).toString("base64"),
+        encrypted: true,
+      };
+    }
+  } catch {
+    // Fall through to plaintext persistence.
+  }
+
+  return { value: secret, encrypted: false };
+}
+
+function decodeConnectionSecret(value: string, encrypted: boolean): string {
+  if (!value) {
+    return "";
+  }
+  if (!encrypted) {
+    return value;
+  }
+
+  try {
+    return safeStorage.decryptString(Buffer.from(value, "base64"));
+  } catch {
+    return "";
+  }
+}
+
+function readDesktopConnectionSettings(): DesktopConnectionSettings {
+  try {
+    const raw = FS.readFileSync(CONNECTION_SETTINGS_PATH, "utf8");
+    const parsed = JSON.parse(raw) as Partial<PersistedDesktopConnectionRecord>;
+    const settings: Partial<DesktopConnectionSettings> = {
+      remoteServerUrl: typeof parsed.remoteServerUrl === "string" ? parsed.remoteServerUrl : "",
+      remoteAuthToken:
+        typeof parsed.remoteAuthToken === "string"
+          ? decodeConnectionSecret(
+              parsed.remoteAuthToken,
+              parsed.remoteAuthTokenEncrypted === true,
+            )
+          : "",
+    };
+    if (parsed.mode === "local" || parsed.mode === "remote") {
+      settings.mode = parsed.mode;
+    }
+    return sanitizeDesktopConnectionSettings(settings);
+  } catch {
+    return cloneDesktopConnectionSettings();
+  }
+}
+
+function writeDesktopConnectionSettings(settings: DesktopConnectionSettings): void {
+  ensureStateDir();
+  const encodedSecret = encodeConnectionSecret(settings.remoteAuthToken);
+  const record: PersistedDesktopConnectionRecord = {
+    version: 1,
+    mode: settings.mode,
+    remoteServerUrl: settings.remoteServerUrl,
+    remoteAuthToken: encodedSecret.value,
+    remoteAuthTokenEncrypted: encodedSecret.encrypted,
+  };
+  FS.writeFileSync(CONNECTION_SETTINGS_PATH, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+}
+
+function resolveRemoteWsUrl(settings: DesktopConnectionSettings): {
+  wsUrl: string | null;
+  fallbackReason: string | null;
+} {
+  if (settings.remoteServerUrl.length === 0) {
+    return {
+      wsUrl: null,
+      fallbackReason: "Remote mode requires a server URL. Falling back to the local backend.",
+    };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(settings.remoteServerUrl);
+  } catch {
+    return {
+      wsUrl: null,
+      fallbackReason: "Remote server URL is invalid. Falling back to the local backend.",
+    };
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return {
+      wsUrl: null,
+      fallbackReason: "Remote server URL must use http or https. Falling back to the local backend.",
+    };
+  }
+
+  const wsUrl = new URL(parsed.toString());
+  wsUrl.protocol = parsed.protocol === "https:" ? "wss:" : "ws:";
+  wsUrl.pathname = "/";
+  wsUrl.search = "";
+  if (settings.remoteAuthToken.length > 0) {
+    wsUrl.searchParams.set("token", settings.remoteAuthToken);
+  }
+
+  return {
+    wsUrl: wsUrl.toString(),
+    fallbackReason: null,
+  };
+}
+
+function buildDesktopConnectionInfo(settings: DesktopConnectionSettings): DesktopConnectionInfo {
+  const nextSettings = cloneDesktopConnectionSettings(settings);
+  if (nextSettings.mode === "remote") {
+    const remote = resolveRemoteWsUrl(nextSettings);
+    if (remote.wsUrl) {
+      return {
+        settings: nextSettings,
+        effectiveMode: "remote",
+        wsUrl: remote.wsUrl,
+        canPickFolder: false,
+        requiresServerPaths: true,
+        usingLocalBackend: false,
+        fallbackReason: null,
+      };
+    }
+
+    return {
+      settings: nextSettings,
+      effectiveMode: "local",
+      wsUrl: null,
+      canPickFolder: true,
+      requiresServerPaths: false,
+      usingLocalBackend: true,
+      fallbackReason: remote.fallbackReason,
+    };
+  }
+
+  return {
+    settings: nextSettings,
+    effectiveMode: "local",
+    wsUrl: null,
+    canPickFolder: true,
+    requiresServerPaths: false,
+    usingLocalBackend: true,
+    fallbackReason: null,
+  };
+}
+
+async function reserveDesktopBackendPort(): Promise<number> {
+  return Effect.service(NetService).pipe(
+    Effect.flatMap((net) => net.reserveLoopbackPort()),
+    Effect.provide(NetService.layer),
+    Effect.runPromise,
+  );
+}
+
+async function applyDesktopConnectionSettings(
+  rawSettings: Partial<DesktopConnectionSettings> | null | undefined,
+  options: { persist?: boolean } = {},
+): Promise<DesktopConnectionInfo> {
+  const settings = sanitizeDesktopConnectionSettings(rawSettings);
+  let nextInfo = buildDesktopConnectionInfo(settings);
+  desktopConnectionInfo = nextInfo;
+
+  if (nextInfo.effectiveMode === "local") {
+    await stopBackendAndWaitForExit();
+    backendPort = await reserveDesktopBackendPort();
+    backendAuthToken = Crypto.randomBytes(24).toString("hex");
+    backendWsUrl = `ws://127.0.0.1:${backendPort}/?token=${encodeURIComponent(backendAuthToken)}`;
+    process.env.T3CODE_DESKTOP_WS_URL = backendWsUrl;
+    nextInfo = {
+      ...nextInfo,
+      wsUrl: backendWsUrl,
+    };
+    writeDesktopLogHeader(
+      `desktop connection active mode=local requested=${settings.mode} port=${backendPort}`,
+    );
+    desktopConnectionInfo = nextInfo;
+    startBackend();
+  } else {
+    await stopBackendAndWaitForExit();
+    backendPort = 0;
+    backendAuthToken = "";
+    backendWsUrl = nextInfo.wsUrl ?? "";
+    process.env.T3CODE_DESKTOP_WS_URL = backendWsUrl;
+    writeDesktopLogHeader(
+      `desktop connection active mode=remote requested=${settings.mode} url=${settings.remoteServerUrl}`,
+    );
+    desktopConnectionInfo = nextInfo;
+  }
+
+  if (options.persist !== false) {
+    writeDesktopConnectionSettings(settings);
+  }
+  return desktopConnectionInfo;
+}
 
 function logTimestamp(): string {
   return new Date().toISOString();
@@ -257,6 +513,15 @@ let updateCheckInFlight = false;
 let updateDownloadInFlight = false;
 let updaterConfigured = false;
 let updateState: DesktopUpdateState = initialUpdateState();
+let desktopConnectionInfo: DesktopConnectionInfo = {
+  settings: DEFAULT_DESKTOP_CONNECTION_SETTINGS,
+  effectiveMode: "local",
+  wsUrl: null,
+  canPickFolder: true,
+  requiresServerPaths: false,
+  usingLocalBackend: true,
+  fallbackReason: null,
+};
 
 function resolveUpdaterErrorContext(): DesktopUpdateErrorContext {
   if (updateDownloadInFlight) return "download";
@@ -868,7 +1133,7 @@ function backendEnv(): NodeJS.ProcessEnv {
 }
 
 function scheduleBackendRestart(reason: string): void {
-  if (isQuitting || restartTimer) return;
+  if (isQuitting || restartTimer || desktopConnectionInfo.effectiveMode !== "local") return;
 
   const delayMs = Math.min(500 * 2 ** restartAttempt, 10_000);
   restartAttempt += 1;
@@ -881,7 +1146,7 @@ function scheduleBackendRestart(reason: string): void {
 }
 
 function startBackend(): void {
-  if (isQuitting || backendProcess) return;
+  if (isQuitting || backendProcess || desktopConnectionInfo.effectiveMode !== "local") return;
 
   const backendEntry = resolveBackendEntry();
   if (!FS.existsSync(backendEntry)) {
@@ -1010,8 +1275,24 @@ async function stopBackendAndWaitForExit(timeoutMs = 5_000): Promise<void> {
 }
 
 function registerIpcHandlers(): void {
+  ipcMain.removeHandler(GET_CONNECTION_INFO_CHANNEL);
+  ipcMain.handle(GET_CONNECTION_INFO_CHANNEL, async () => desktopConnectionInfo);
+
+  ipcMain.removeHandler(SET_CONNECTION_SETTINGS_CHANNEL);
+  ipcMain.handle(SET_CONNECTION_SETTINGS_CHANNEL, async (_event, rawSettings: unknown) => {
+    if (typeof rawSettings !== "object" || rawSettings === null) {
+      throw new Error("Connection settings payload must be an object.");
+    }
+
+    return applyDesktopConnectionSettings(rawSettings as Partial<DesktopConnectionSettings>);
+  });
+
   ipcMain.removeHandler(PICK_FOLDER_CHANNEL);
   ipcMain.handle(PICK_FOLDER_CHANNEL, async () => {
+    if (!desktopConnectionInfo.canPickFolder) {
+      return null;
+    }
+
     const owner = BrowserWindow.getFocusedWindow() ?? mainWindow;
     const result = owner
       ? await dialog.showOpenDialog(owner, {
@@ -1241,21 +1522,10 @@ configureAppIdentity();
 
 async function bootstrap(): Promise<void> {
   writeDesktopLogHeader("bootstrap start");
-  backendPort = await Effect.service(NetService).pipe(
-    Effect.flatMap((net) => net.reserveLoopbackPort()),
-    Effect.provide(NetService.layer),
-    Effect.runPromise,
-  );
-  writeDesktopLogHeader(`reserved backend port via NetService port=${backendPort}`);
-  backendAuthToken = Crypto.randomBytes(24).toString("hex");
-  backendWsUrl = `ws://127.0.0.1:${backendPort}/?token=${encodeURIComponent(backendAuthToken)}`;
-  process.env.T3CODE_DESKTOP_WS_URL = backendWsUrl;
-  writeDesktopLogHeader(`bootstrap resolved websocket url=${backendWsUrl}`);
-
   registerIpcHandlers();
   writeDesktopLogHeader("bootstrap ipc handlers registered");
-  startBackend();
-  writeDesktopLogHeader("bootstrap backend start requested");
+  await applyDesktopConnectionSettings(readDesktopConnectionSettings(), { persist: false });
+  writeDesktopLogHeader(`bootstrap resolved websocket url=${backendWsUrl}`);
   mainWindow = createWindow();
   writeDesktopLogHeader("bootstrap main window created");
 }

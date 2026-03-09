@@ -88,8 +88,28 @@ export interface DesktopUpdateActionResult {
   state: DesktopUpdateState;
 }
 
+export type DesktopConnectionMode = "local" | "remote";
+
+export interface DesktopConnectionSettings {
+  mode: DesktopConnectionMode;
+  remoteServerUrl: string;
+  remoteAuthToken: string;
+}
+
+export interface DesktopConnectionInfo {
+  settings: DesktopConnectionSettings;
+  effectiveMode: DesktopConnectionMode;
+  wsUrl: string | null;
+  canPickFolder: boolean;
+  requiresServerPaths: boolean;
+  usingLocalBackend: boolean;
+  fallbackReason: string | null;
+}
+
 export interface DesktopBridge {
   getWsUrl: () => string | null;
+  getConnectionInfo: () => Promise<DesktopConnectionInfo>;
+  setConnectionSettings: (settings: DesktopConnectionSettings) => Promise<DesktopConnectionInfo>;
   pickFolder: () => Promise<string | null>;
   confirm: (message: string) => Promise<boolean>;
   showContextMenu: <T extends string>(

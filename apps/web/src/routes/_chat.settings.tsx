@@ -1,10 +1,11 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
-import { useCallback, useState } from "react";
-import { type ProviderKind } from "@t3tools/contracts";
+import { useCallback, useEffect, useState } from "react";
+import { type DesktopConnectionMode, type ProviderKind } from "@t3tools/contracts";
 import { getModelOptions, normalizeModelSlug } from "@t3tools/shared/model";
 
 import { MAX_CUSTOM_MODEL_LENGTH, useAppSettings } from "../appSettings";
+import { useDesktopConnectionInfo } from "../desktopConnection";
 import { isElectron } from "../env";
 import { useTheme } from "../hooks/useTheme";
 import { serverConfigQueryOptions } from "../lib/serverReactQuery";
@@ -82,6 +83,7 @@ function patchCustomModels(provider: ProviderKind, models: string[]) {
 function SettingsRouteView() {
   const { theme, setTheme, resolvedTheme } = useTheme();
   const { settings, defaults, updateSettings } = useAppSettings();
+  const { connectionInfo, error: connectionInfoError } = useDesktopConnectionInfo();
   const serverConfigQuery = useQuery(serverConfigQueryOptions());
   const [isOpeningKeybindings, setIsOpeningKeybindings] = useState(false);
   const [openKeybindingsError, setOpenKeybindingsError] = useState<string | null>(null);
@@ -93,10 +95,27 @@ function SettingsRouteView() {
   const [customModelErrorByProvider, setCustomModelErrorByProvider] = useState<
     Partial<Record<ProviderKind, string | null>>
   >({});
+  const [connectionMode, setConnectionMode] = useState<DesktopConnectionMode>("local");
+  const [remoteServerUrl, setRemoteServerUrl] = useState("");
+  const [remoteAuthToken, setRemoteAuthToken] = useState("");
+  const [connectionSettingsLoaded, setConnectionSettingsLoaded] = useState(false);
+  const [isSavingConnectionSettings, setIsSavingConnectionSettings] = useState(false);
+  const [connectionSaveError, setConnectionSaveError] = useState<string | null>(null);
 
   const codexBinaryPath = settings.codexBinaryPath;
   const codexHomePath = settings.codexHomePath;
   const keybindingsConfigPath = serverConfigQuery.data?.keybindingsConfigPath ?? null;
+
+  useEffect(() => {
+    if (!connectionInfo || connectionSettingsLoaded) {
+      return;
+    }
+
+    setConnectionMode(connectionInfo.settings.mode);
+    setRemoteServerUrl(connectionInfo.settings.remoteServerUrl);
+    setRemoteAuthToken(connectionInfo.settings.remoteAuthToken);
+    setConnectionSettingsLoaded(true);
+  }, [connectionInfo, connectionSettingsLoaded]);
 
   const openKeybindingsFile = useCallback(() => {
     if (!keybindingsConfigPath) return;
@@ -171,6 +190,58 @@ function SettingsRouteView() {
     [settings, updateSettings],
   );
 
+  const saveConnectionSettings = useCallback(() => {
+    if (!window.desktopBridge?.setConnectionSettings) {
+      return;
+    }
+
+    const trimmedServerUrl = remoteServerUrl.trim();
+    const trimmedAuthToken = remoteAuthToken.trim();
+    setConnectionSaveError(null);
+
+    if (connectionMode === "remote") {
+      if (trimmedServerUrl.length === 0) {
+        setConnectionSaveError("Remote mode requires a server URL.");
+        return;
+      }
+      try {
+        const parsed = new URL(trimmedServerUrl);
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+          throw new Error("Remote server URL must use http or https.");
+        }
+      } catch (error) {
+        setConnectionSaveError(
+          error instanceof Error ? error.message : "Remote server URL is invalid.",
+        );
+        return;
+      }
+
+      if (trimmedAuthToken.length === 0) {
+        setConnectionSaveError("Remote mode requires the T3 auth token.");
+        return;
+      }
+    }
+
+    setIsSavingConnectionSettings(true);
+    void window.desktopBridge
+      .setConnectionSettings({
+        mode: connectionMode,
+        remoteServerUrl: trimmedServerUrl,
+        remoteAuthToken: trimmedAuthToken,
+      })
+      .then(() => {
+        window.location.reload();
+      })
+      .catch((error) => {
+        setConnectionSaveError(
+          error instanceof Error ? error.message : "Unable to save connection settings.",
+        );
+      })
+      .finally(() => {
+        setIsSavingConnectionSettings(false);
+      });
+  }, [connectionMode, remoteAuthToken, remoteServerUrl]);
+
   return (
     <SidebarInset className="h-dvh min-h-0 overflow-hidden overscroll-y-none bg-background text-foreground isolate">
       <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-background text-foreground">
@@ -190,6 +261,130 @@ function SettingsRouteView() {
                 Configure app-level preferences for this device.
               </p>
             </header>
+
+            {isElectron ? (
+              <section className="rounded-2xl border border-border bg-card p-5">
+                <div className="mb-4">
+                  <h2 className="text-sm font-medium text-foreground">Desktop connection</h2>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Choose whether the desktop app runs its own backend or attaches to a server
+                    that is already running elsewhere.
+                  </p>
+                </div>
+
+                <div className="space-y-4">
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    {([
+                      {
+                        value: "local",
+                        title: "Local backend",
+                        description: "Launch the bundled backend inside the desktop app.",
+                      },
+                      {
+                        value: "remote",
+                        title: "Remote server",
+                        description: "Connect to your WSL or Tailscale-hosted T3 server.",
+                      },
+                    ] as const).map((option) => {
+                      const selected = connectionMode === option.value;
+                      return (
+                        <button
+                          key={option.value}
+                          type="button"
+                          className={`rounded-xl border px-3 py-3 text-left transition-colors ${
+                            selected
+                              ? "border-primary bg-primary/5"
+                              : "border-border bg-background hover:bg-accent/40"
+                          }`}
+                          onClick={() => setConnectionMode(option.value)}
+                        >
+                          <p className="text-sm font-medium text-foreground">{option.title}</p>
+                          <p className="mt-1 text-xs text-muted-foreground">{option.description}</p>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground/70">
+                      Server URL
+                    </label>
+                    <Input
+                      value={remoteServerUrl}
+                      onChange={(event) => setRemoteServerUrl(event.target.value)}
+                      placeholder="http://127.0.0.1:3773 or https://desktop.tail36211e.ts.net:8443"
+                      spellCheck={false}
+                      autoCapitalize="off"
+                      autoCorrect="off"
+                      className="font-mono text-xs"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      This PC should use <code>http://127.0.0.1:3773</code>. Your laptop should use{" "}
+                      <code>https://desktop.tail36211e.ts.net:8443</code>.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground/70">
+                      Auth token
+                    </label>
+                    <Input
+                      type="password"
+                      value={remoteAuthToken}
+                      onChange={(event) => setRemoteAuthToken(event.target.value)}
+                      placeholder="Paste the T3 auth token"
+                      spellCheck={false}
+                      autoCapitalize="off"
+                      autoCorrect="off"
+                      className="font-mono text-xs"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Remote mode uses the token from the WSL server configuration.
+                    </p>
+                  </div>
+
+                  <div className="rounded-lg border border-border bg-background px-3 py-2 text-xs text-muted-foreground">
+                    <p>
+                      Active mode:{" "}
+                      <span className="font-medium text-foreground">
+                        {connectionInfo?.effectiveMode === "remote" ? "Remote server" : "Local backend"}
+                      </span>
+                    </p>
+                    <p className="mt-1 break-all font-mono">
+                      Endpoint: {connectionInfo?.wsUrl ?? "Resolving..."}
+                    </p>
+                    {connectionInfo?.requiresServerPaths ? (
+                      <p className="mt-1">
+                        Remote mode disables the native folder picker. Use Linux server paths like{" "}
+                        <code>/projects/...</code> or <code>/mnt/wsl/...</code>.
+                      </p>
+                    ) : null}
+                    {connectionInfo?.fallbackReason ? (
+                      <p className="mt-1 text-amber-600 dark:text-amber-300">
+                        {connectionInfo.fallbackReason}
+                      </p>
+                    ) : null}
+                    {connectionInfoError ? (
+                      <p className="mt-1 text-destructive">{connectionInfoError}</p>
+                    ) : null}
+                  </div>
+
+                  {connectionSaveError ? (
+                    <p className="text-xs text-destructive">{connectionSaveError}</p>
+                  ) : null}
+
+                  <div className="flex justify-end">
+                    <Button
+                      size="sm"
+                      onClick={saveConnectionSettings}
+                      disabled={isSavingConnectionSettings}
+                    >
+                      {isSavingConnectionSettings ? "Saving..." : "Save and reconnect"}
+                    </Button>
+                  </div>
+                </div>
+              </section>
+            ) : null}
 
             <section className="rounded-2xl border border-border bg-card p-5">
               <div className="mb-4">

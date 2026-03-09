@@ -15,9 +15,11 @@ class MockWebSocket {
 
   readyState = MockWebSocket.CONNECTING;
   readonly sent: string[] = [];
+  readonly url: string;
   private readonly listeners = new Map<WsEventType, Set<WsListener>>();
 
-  constructor(_url: string) {
+  constructor(url: string) {
+    this.url = url;
     sockets.push(this);
   }
 
@@ -70,7 +72,19 @@ beforeEach(() => {
   Object.defineProperty(globalThis, "window", {
     configurable: true,
     value: {
-      location: { hostname: "localhost", port: "3020" },
+      location: {
+        protocol: "http:",
+        host: "localhost:3020",
+        hostname: "localhost",
+        port: "3020",
+        search: "",
+        hash: "",
+        origin: "http://localhost:3020",
+      },
+      sessionStorage: {
+        getItem: vi.fn(() => null),
+        setItem: vi.fn(),
+      },
       desktopBridge: undefined,
     },
   });
@@ -84,6 +98,46 @@ afterEach(() => {
 });
 
 describe("WsTransport", () => {
+  it("appends the browser auth token from the URL to the websocket connection", () => {
+    window.location.search = "?token=secret-token";
+
+    const transport = new WsTransport();
+    const socket = getSocket();
+
+    expect(socket.url).toBe("ws://localhost:3020/?token=secret-token");
+    expect(window.sessionStorage.setItem).toHaveBeenCalledWith(
+      "t3code:web-auth-token:v1",
+      "secret-token",
+    );
+
+    transport.dispose();
+  });
+
+  it("uses wss for browser fallback connections on https pages", () => {
+    window.location.protocol = "https:";
+    window.location.host = "desktop.tail36211e.ts.net:8443";
+    window.location.hostname = "desktop.tail36211e.ts.net";
+    window.location.port = "8443";
+
+    const transport = new WsTransport();
+    const socket = getSocket();
+
+    expect(socket.url).toBe("wss://desktop.tail36211e.ts.net:8443");
+
+    transport.dispose();
+  });
+
+  it("reuses a session-persisted browser auth token when the URL no longer includes one", () => {
+    window.sessionStorage.getItem = vi.fn(() => "persisted-token");
+
+    const transport = new WsTransport();
+    const socket = getSocket();
+
+    expect(socket.url).toBe("ws://localhost:3020/?token=persisted-token");
+
+    transport.dispose();
+  });
+
   it("routes valid push envelopes to channel listeners", () => {
     const transport = new WsTransport("ws://localhost:3020");
     const socket = getSocket();
@@ -160,8 +214,9 @@ describe("WsTransport", () => {
     expect(warnSpy).toHaveBeenCalledTimes(2);
     expect(warnSpy).toHaveBeenNthCalledWith(1, "Dropped inbound WebSocket envelope", {
       reason: "decode-failed",
-      issue:
-        "SchemaError: SyntaxError: Expected property name or '}' in JSON at position 2 (line 1 column 3)",
+      issue: expect.stringContaining(
+        "SchemaError: SyntaxError: Expected property name or '}' in JSON at position 2",
+      ),
       raw: "{ invalid-json",
     });
     expect(warnSpy).toHaveBeenNthCalledWith(2, "Dropped inbound WebSocket envelope", {

@@ -14,6 +14,7 @@ const RECONNECT_DELAYS_MS = [500, 1_000, 2_000, 4_000, 8_000];
 const decodeWsResponseFromJson = Schema.decodeUnknownExit(Schema.fromJsonString(WsResponse));
 const isWsPushEnvelope = Schema.is(WsPush);
 const isWebSocketResponseEnvelope = Schema.is(WebSocketResponse);
+const WEB_AUTH_TOKEN_SESSION_KEY = "t3code:web-auth-token:v1";
 
 interface WsRequestEnvelope {
   id: string;
@@ -21,6 +22,84 @@ interface WsRequestEnvelope {
     _tag: string;
     [key: string]: unknown;
   };
+}
+
+function readBrowserAuthToken(): string | null {
+  if (typeof window === "undefined") return null;
+
+  const candidates: string[] = [];
+
+  try {
+    const params = new URLSearchParams(window.location.search ?? "");
+    const token = params.get("token");
+    if (token) {
+      candidates.push(token);
+    }
+  } catch {
+    // Ignore malformed URL search params.
+  }
+
+  try {
+    const rawHash = window.location.hash ?? "";
+    const normalizedHash = rawHash.startsWith("#") ? rawHash.slice(1) : rawHash;
+    const hashParams = new URLSearchParams(normalizedHash);
+    const token = hashParams.get("token");
+    if (token) {
+      candidates.push(token);
+    }
+  } catch {
+    // Ignore malformed hash params.
+  }
+
+  for (const candidate of candidates) {
+    const normalized = candidate.trim();
+    if (normalized.length === 0) continue;
+    try {
+      window.sessionStorage?.setItem(WEB_AUTH_TOKEN_SESSION_KEY, normalized);
+    } catch {
+      // Ignore storage failures and continue with in-memory use.
+    }
+    return normalized;
+  }
+
+  try {
+    const persisted = window.sessionStorage?.getItem(WEB_AUTH_TOKEN_SESSION_KEY) ?? null;
+    if (persisted && persisted.trim().length > 0) {
+      return persisted.trim();
+    }
+  } catch {
+    // Ignore storage failures and fall through.
+  }
+
+  return null;
+}
+
+function appendAuthToken(url: string, token: string | null): string {
+  if (!token || token.length === 0) {
+    return url;
+  }
+
+  try {
+    const resolved = new URL(
+      url,
+      typeof window !== "undefined" ? window.location.origin : undefined,
+    );
+    if (!resolved.searchParams.has("token")) {
+      resolved.searchParams.set("token", token);
+    }
+    return resolved.toString();
+  } catch {
+    return url;
+  }
+}
+
+function getBrowserFallbackWsUrl(): string {
+  if (typeof window === "undefined") {
+    return "ws://127.0.0.1";
+  }
+
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}`;
 }
 
 export class WsTransport {
@@ -38,13 +117,14 @@ export class WsTransport {
     // In dev mode, VITE_WS_URL points to the server's WebSocket endpoint.
     // In production, the page is served by the WS server on the same host:port.
     const envUrl = import.meta.env.VITE_WS_URL as string | undefined;
-    this.url =
+    const baseUrl =
       url ??
       (bridgeUrl && bridgeUrl.length > 0
         ? bridgeUrl
         : envUrl && envUrl.length > 0
           ? envUrl
-          : `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.hostname}:${window.location.port}`);
+          : getBrowserFallbackWsUrl());
+    this.url = appendAuthToken(baseUrl, readBrowserAuthToken());
     this.connect();
   }
 

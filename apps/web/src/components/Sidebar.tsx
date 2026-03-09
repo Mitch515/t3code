@@ -38,6 +38,7 @@ import {
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useNavigate, useParams } from "@tanstack/react-router";
 import { useAppSettings } from "../appSettings";
+import { useDesktopConnectionInfo } from "../desktopConnection";
 import { isElectron } from "../env";
 import { APP_STAGE_LABEL } from "../branding";
 import { newCommandId, newProjectId, newThreadId } from "../lib/utils";
@@ -252,8 +253,10 @@ function SortableProjectItem({
 }
 
 export default function Sidebar() {
+  const { connectionInfo: desktopConnectionInfo } = useDesktopConnectionInfo();
   const projects = useStore((store) => store.projects);
   const threads = useStore((store) => store.threads);
+  const syncServerReadModel = useStore((store) => store.syncServerReadModel);
   const markThreadUnread = useStore((store) => store.markThreadUnread);
   const toggleProject = useStore((store) => store.toggleProject);
   const reorderProjects = useStore((store) => store.reorderProjects);
@@ -554,7 +557,7 @@ export default function Sidebar() {
 
   const handlePickFolder = async () => {
     const api = readNativeApi();
-    if (!api || isPickingFolder) return;
+    if (!api || isPickingFolder || desktopConnectionInfo?.canPickFolder === false) return;
     setIsPickingFolder(true);
     let pickedPath: string | null = null;
     try {
@@ -728,6 +731,12 @@ export default function Sidebar() {
         commandId: newCommandId(),
         threadId,
       });
+      await api.orchestration
+        .getSnapshot()
+        .then((snapshot) => {
+          syncServerReadModel(snapshot);
+        })
+        .catch(() => undefined);
       clearComposerDraftForThread(threadId);
       clearProjectDraftThreadById(thread.projectId, thread.id);
       clearTerminalState(threadId);
@@ -778,6 +787,7 @@ export default function Sidebar() {
       projects,
       removeWorktreeMutation,
       routeThreadId,
+      syncServerReadModel,
       threads,
     ],
   );
@@ -821,6 +831,12 @@ export default function Sidebar() {
           commandId: newCommandId(),
           projectId,
         });
+        await api.orchestration
+          .getSnapshot()
+          .then((snapshot) => {
+            syncServerReadModel(snapshot);
+          })
+          .catch(() => undefined);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error deleting project.";
         console.error("Failed to remove project", { projectId, error });
@@ -836,6 +852,7 @@ export default function Sidebar() {
       clearProjectDraftThreadId,
       getDraftThreadByProjectId,
       projects,
+      syncServerReadModel,
       threads,
     ],
   );
@@ -1187,7 +1204,7 @@ export default function Sidebar() {
 
           {shouldShowProjectPathEntry && (
             <div className="mb-2 px-1">
-              {isElectron && (
+              {isElectron && desktopConnectionInfo?.canPickFolder !== false && (
                 <button
                   type="button"
                   className="mb-1.5 flex w-full items-center justify-center gap-2 rounded-md border border-border bg-secondary py-1.5 text-xs text-foreground/80 transition-colors duration-150 hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
@@ -1198,6 +1215,12 @@ export default function Sidebar() {
                   {isPickingFolder ? "Picking folder..." : "Browse for folder"}
                 </button>
               )}
+              {desktopConnectionInfo?.requiresServerPaths ? (
+                <p className="mb-1.5 px-0.5 text-[11px] leading-tight text-muted-foreground/70">
+                  Remote mode uses Linux server paths like <code>/projects/...</code> or{" "}
+                  <code>/mnt/wsl/...</code>.
+                </p>
+              ) : null}
               <div className="flex gap-1.5">
                 <input
                   ref={addProjectInputRef}

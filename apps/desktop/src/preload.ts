@@ -10,10 +10,14 @@ const UPDATE_STATE_CHANNEL = "desktop:update-state";
 const UPDATE_GET_STATE_CHANNEL = "desktop:update-get-state";
 const UPDATE_DOWNLOAD_CHANNEL = "desktop:update-download";
 const UPDATE_INSTALL_CHANNEL = "desktop:update-install";
+const GET_CONNECTION_INFO_CHANNEL = "desktop:get-connection-info";
+const SET_CONNECTION_SETTINGS_CHANNEL = "desktop:set-connection-settings";
 const wsUrl = process.env.T3CODE_DESKTOP_WS_URL ?? null;
 
 contextBridge.exposeInMainWorld("desktopBridge", {
   getWsUrl: () => wsUrl,
+  getConnectionInfo: () => ipcRenderer.invoke(GET_CONNECTION_INFO_CHANNEL),
+  setConnectionSettings: (settings) => ipcRenderer.invoke(SET_CONNECTION_SETTINGS_CHANNEL, settings),
   pickFolder: () => ipcRenderer.invoke(PICK_FOLDER_CHANNEL),
   confirm: (message) => ipcRenderer.invoke(CONFIRM_CHANNEL, message),
   showContextMenu: (items, position) => ipcRenderer.invoke(CONTEXT_MENU_CHANNEL, items, position),
